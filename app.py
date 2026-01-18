@@ -158,6 +158,76 @@ def criar_video():
     finally:
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
+            
+@app.route('/queimar-legenda', methods=['POST'])
+def queimar_legenda():
+    """Baixa vídeo e .ass, queima a legenda e sobe o vídeo final."""
+    data = request.json
+    bucket_in = data.get('bucket_in')
+    video_key = data.get('video_key')       # ex: video_sem_legenda.mp4
+    subtitle_key = data.get('subtitle_key') # ex: legenda.ass
+    bucket_out = data.get('bucket_out')
+
+    unique_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{unique_id}"
+    os.makedirs(work_dir, exist_ok=True)
+
+    local_video = f"{work_dir}/input_video.mp4"
+    local_sub = f"{work_dir}/legenda.ass"
+    local_output = f"{work_dir}/video_com_legenda.mp4"
+
+    try:
+        # 1. Download dos Arquivos
+        print(f"[{unique_id}] Baixando vídeo: {video_key}")
+        try:
+            s3.download_file(bucket_in, video_key, local_video)
+        except Exception:
+            raise Exception(f"Vídeo '{video_key}' não encontrado.")
+
+        print(f"[{unique_id}] Baixando legenda: {subtitle_key}")
+        try:
+            s3.download_file(bucket_in, subtitle_key, local_sub)
+        except Exception:
+            raise Exception(f"Legenda '{subtitle_key}' não encontrada.")
+
+        # 2. Processamento FFmpeg (Burn)
+        print(f"[{unique_id}] Queimando legendas...")
+        
+        # O filtro 'ass' exige o caminho completo do arquivo
+        # Usamos -c:a copy para não perder tempo reprocessando o áudio (que já está bom)
+        # Usamos -c:v libx264 para re-encodar o vídeo com os pixels da legenda
+        command = [
+            'ffmpeg', '-y',
+            '-i', local_video,
+            '-vf', f"ass={local_sub}",
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',  # Mais rápido (use 'medium' para menor arquivo)
+            '-c:a', 'copy',          # Copia o áudio sem mexer (rápido)
+            local_output
+        ]
+
+        result = subprocess.run(command, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            # Se der erro, mostramos o log do FFmpeg para debug
+            raise Exception(f"Erro FFmpeg: {result.stderr}")
+
+        # 3. Upload
+        output_key = f"final_com_legenda_{unique_id}.mp4"
+        print(f"[{unique_id}] Subindo {output_key}...")
+        s3.upload_file(local_output, bucket_out, output_key)
+
+        return jsonify({
+            "status": "sucesso",
+            "file": output_key,
+            "bucket": bucket_out
+        }), 200
+
+    except Exception as e:
+        print(f"ERRO LEGENDA: {e}")
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
