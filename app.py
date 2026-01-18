@@ -311,6 +311,99 @@ def adicionar_musica():
         return jsonify({"erro": str(e)}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+import textwrap # Adicione isso no topo do arquivo junto com os outros imports
+
+# --- ROTA 5: GERAR THUMBNAIL COM TEXTO ---
+@app.route('/gerar-thumbnail', methods=['POST'])
+def gerar_thumbnail():
+    data = request.json
+    bucket_in = data.get('bucket_in')
+    image_key = data.get('image_key')   # A imagem gerada pelo DALL-E
+    text = data.get('text', '')         # A frase do Gemini
+    bucket_out = data.get('bucket_out')
+    
+    # Configurações visuais
+    font_key = "font.ttf" # Nome da fonte no seu bucket
+    max_chars = 20        # Quebra de linha
+    
+    unique_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{unique_id}"
+    os.makedirs(work_dir, exist_ok=True)
+
+    local_image = f"{work_dir}/thumb_input.png"
+    local_font = f"{work_dir}/font.ttf"
+    local_output = f"{work_dir}/thumb_final.jpg"
+
+    try:
+        # 1. Downloads
+        print(f"[{unique_id}] Baixando imagem e fonte...")
+        try:
+            s3.download_file(bucket_in, image_key, local_image)
+            s3.download_file(bucket_in, font_key, local_font)
+        except Exception:
+            raise Exception("Erro ao baixar imagem ou fonte (font.ttf). Verifique o MinIO.")
+
+        # 2. Processamento do Texto (Lógica do JS traduzida para Python)
+        lines = textwrap.wrap(text, width=max_chars)
+        
+        # Ajuste dinâmico de tamanho
+        font_size = 70 if len(text) > 50 else 90
+        line_spacing = int(font_size * 1.4)
+        
+        # Calcula altura inicial para centralizar verticalmente
+        total_height = (len(lines) - 1) * line_spacing
+        start_y = 400 - (total_height / 2) # Assumindo centro ~400px (para img 1024x1024)
+
+        # 3. Construção do Filtro FFmpeg
+        draw_cmds = []
+        for i, line in enumerate(lines):
+            # Escapar caracteres especiais para o FFmpeg
+            safe_line = line.replace(":", "\\:").replace("'", "")
+            
+            y_pos = start_y + (i * line_spacing)
+            
+            # Lógica de Cor: Linha 2 (índice 1) Vermelha, resto Amarela
+            color = "red" if i == 1 else "yellow"
+            
+            cmd = (
+                f"drawtext=fontfile='{local_font}':text='{safe_line}':"
+                f"fontcolor={color}:fontsize={font_size}:"
+                f"shadowcolor=black:shadowx=5:shadowy=5:" # Sombra forte para leitura
+                f"x=(w-text_w)/2:y={y_pos}"
+            )
+            draw_cmds.append(cmd)
+
+        filter_complex = ",".join(draw_cmds)
+
+        print(f"[{unique_id}] Escrevendo texto na thumbnail...")
+        command = [
+            'ffmpeg', '-y',
+            '-i', local_image,
+            '-vf', filter_complex,
+            '-q:v', '2', # Qualidade JPG alta
+            local_output
+        ]
+
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"Erro FFmpeg: {result.stderr}")
+
+        # 4. Upload
+        output_key = f"THUMB_FINAL_{unique_id}.jpg"
+        s3.upload_file(local_output, bucket_out, output_key)
+
+        return jsonify({
+            "status": "sucesso",
+            "file": output_key,
+            "phrase_used": text
+        }), 200
+
+    except Exception as e:
+        print(f"ERRO THUMB: {e}")
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
         
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
