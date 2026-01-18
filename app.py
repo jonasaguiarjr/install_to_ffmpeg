@@ -20,20 +20,48 @@ def get_audio_duration(file_path):
     cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
     return float(subprocess.check_output(cmd).decode('utf-8').strip())
 
+# --- ROTA 1: PROCESSAR ÁUDIO (Restaurada) ---
 @app.route('/processar-audio', methods=['POST'])
 def processar_audio():
-    """Rota auxiliar para checagem ou processamento simples de áudio."""
-    try:
-        data = request.json
-        bucket_in = data.get('bucket_in')
-        file_key = data.get('file_key')
-        
-        # Lógica simples para retornar sucesso e confirmar que o servidor está vivo
-        # Se precisar recuperar a duração aqui também, podemos implementar.
-        return jsonify({"status": "sucesso", "message": "Endpoint de áudio ativo"}), 200
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+    """Baixa o áudio e retorna sua duração exata."""
+    data = request.json
+    bucket_in = data.get('bucket_in')
+    file_key = data.get('file_key')
+    bucket_out = data.get('bucket_out')
 
+    unique_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{unique_id}"
+    os.makedirs(work_dir, exist_ok=True)
+    local_input = f"{work_dir}/audio_temp.mp3"
+
+    try:
+        print(f"[{unique_id}] Analisando áudio: {file_key}")
+        
+        # 1. Download
+        s3.download_file(bucket_in, file_key, local_input)
+
+        if os.path.getsize(local_input) == 0:
+            raise Exception("Arquivo de áudio vazio.")
+
+        # 2. Pega a duração
+        duration = get_audio_duration(local_input)
+        print(f"[{unique_id}] Duração detectada: {duration}s")
+
+        return jsonify({
+            "status": "sucesso", 
+            "file": file_key, 
+            "bucket": bucket_out,
+            "duration_seconds": duration,
+            "duration_formatted": f"{duration:.2f}s"
+        }), 200
+
+    except Exception as e:
+        print(f"ERRO AUDIO: {e}")
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+# --- ROTA 2: CRIAR VÍDEO (Slideshow Sincronizado) ---
 @app.route('/criar-video', methods=['POST'])
 def criar_video():
     """Gera um vídeo slideshow sincronizado usando Concat Demuxer."""
@@ -62,8 +90,6 @@ def criar_video():
         # 2. Download das Imagens e Padronização
         print(f"[{unique_id}] Baixando {len(images_list)} imagens...")
         local_images = []
-        
-        # Forçamos todos os arquivos locais a serem .jpg para o FFmpeg não reclamar
         master_ext = "jpg" 
         
         for index, img_key in enumerate(images_list):
@@ -75,46 +101,34 @@ def criar_video():
             except Exception:
                 raise Exception(f"ERRO: Imagem '{img_key}' (índice {index+1}) não encontrada no bucket.")
 
-        # 3. Cálculo do Tempo (Divisão igualitária do tempo do áudio)
+        # 3. Cálculo do Tempo
         audio_duration = get_audio_duration(local_audio)
         total_imagens = len(local_images)
-        
-        # Tempo exato que cada imagem deve ficar na tela
         tempo_por_imagem = audio_duration / total_imagens
 
         # 4. Criar arquivo 'inputs.txt' (Concat Demuxer)
-        # Esse método garante que cada imagem apareça pelo tempo exato calculado
         concat_file_path = f"{work_dir}/inputs.txt"
         with open(concat_file_path, 'w') as f:
             for img_name in local_images:
                 f.write(f"file '{img_name}'\n")
                 f.write(f"duration {tempo_por_imagem:.4f}\n")
-            
-            # Repete a última imagem sem duração para evitar "glitch" no final
-            # (O FFmpeg precisa disso para fechar o stream de vídeo corretamente)
             f.write(f"file '{local_images[-1]}'\n")
 
         # 5. Renderização FFmpeg
         local_video_out = f"{work_dir}/video_final.mp4"
         print(f"[{unique_id}] Renderizando: {total_imagens} imagens, {tempo_por_imagem:.2f}s cada...")
         
-        # Comando para Slideshow Dinâmico
         command = [
             'ffmpeg', '-y',
-            '-f', 'concat',       # Usa o arquivo de lista como input
-            '-safe', '0',         # Permite ler caminhos de arquivos
+            '-f', 'concat', '-safe', '0',
             '-i', concat_file_path,
             '-i', local_audio,
-            '-c:v', 'libx264',
-            '-r', '30',           # 30 FPS fixo
-            '-pix_fmt', 'yuv420p',
-            '-shortest',          # Corta o vídeo quando o áudio acabar
+            '-c:v', 'libx264', '-r', '30', '-pix_fmt', 'yuv420p',
+            '-shortest',
             local_video_out
         ]
 
-        # Tratamento especial OTIMIZADO para apenas 1 imagem (Vídeo Estático)
         if total_imagens == 1:
-            print(f"[{unique_id}] Modo imagem única detectado.")
             command = [
                 'ffmpeg', '-y', '-loop', '1',
                 '-i', f"{work_dir}/{local_images[0]}",
@@ -142,7 +156,6 @@ def criar_video():
         print(f"ERRO: {e}")
         return jsonify({"erro": str(e)}), 500
     finally:
-        # Limpeza da pasta temporária
         if os.path.exists(work_dir):
             shutil.rmtree(work_dir, ignore_errors=True)
 
