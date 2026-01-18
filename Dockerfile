@@ -23,4 +23,4 @@ RUN npm install express
 EXPOSE 3000
 
 # Comando para manter o container rodando
-CMD ["sleep", "infinity", "node", "server.js"]
+CMD ["node", "server.js"]
