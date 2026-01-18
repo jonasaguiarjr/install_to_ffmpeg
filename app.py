@@ -315,55 +315,59 @@ def adicionar_musica():
 
 import textwrap # Adicione isso no topo do arquivo junto com os outros imports
 
-# --- ROTA 5: GERAR THUMBNAIL (COM TEXTO E CORES) ---
+# --- ROTA 5: GERAR THUMBNAIL (COM TEXTO E ARQUIVOS DO MINIO) ---
 @app.route('/gerar-thumbnail', methods=['POST'])
 def gerar_thumbnail():
     data = request.json
-    bucket_in = data.get('bucket_in')
-    image_key = data.get('image_key')   # Nome do arquivo da imagem no MinIO
-    text = data.get('text', '')         # O texto do título
-    bucket_out = data.get('bucket_out')
     
-    # Configurações
-    font_key = "font.ttf"  # VOCÊ PRECISA TER ESSE ARQUIVO NO BUCKET
-    max_chars = 22         # Igual ao seu script JS
+    # 1. Parâmetros (com valores padrão para o seu teste)
+    bucket_name = data.get('bucket_in', 'ffmpeg') # Nome do bucket
     
+    # Se o n8n não mandar nome, usa 'thumbnail.jpg'
+    image_key = data.get('image_key', 'thumbnail.jpg') 
+    
+    # Nome exato da fonte no MinIO
+    font_key = "montserrat-black.ttf" 
+    
+    text = data.get('text', 'Roteiro 303') # Texto padrão se vazio
+    
+    # 2. Preparação do ambiente temporário
     unique_id = str(uuid.uuid4())
     work_dir = f"/tmp/{unique_id}"
     os.makedirs(work_dir, exist_ok=True)
 
-    local_image = f"{work_dir}/thumb_input.jpg"
-    local_font = f"{work_dir}/font.ttf"
-    local_output = f"{work_dir}/thumb_final.jpg"
+    local_image = f"{work_dir}/input_image.jpg"
+    local_font = f"{work_dir}/font.ttf" # Nome local simplificado
+    local_output = f"{work_dir}/output_thumb.jpg"
 
     try:
-        # 1. Baixar Imagem e Fonte
-        print(f"[{unique_id}] Baixando recursos...")
+        # 3. Downloads do MinIO (A Mágica acontece aqui)
+        print(f"[{unique_id}] Baixando {image_key} e {font_key} do bucket {bucket_name}...")
+        
         try:
-            s3.download_file(bucket_in, image_key, local_image)
-            s3.download_file(bucket_in, font_key, local_font)
+            # Baixa a imagem
+            s3.download_file(bucket_name, image_key, local_image)
+            # Baixa a fonte
+            s3.download_file(bucket_name, font_key, local_font)
         except Exception as e:
-            raise Exception(f"Erro ao baixar imagem ou 'font.ttf': {str(e)}")
+            return jsonify({"erro": f"Falha ao baixar arquivos do MinIO: {str(e)}"}), 500
 
-        # 2. Lógica de Quebra de Linha (Igual ao seu JS)
+        # 4. Processamento do Texto (Quebra de linha e Cores)
+        # ... (Mantendo sua lógica de texto intacta) ...
+        import textwrap
+        max_chars = 22
         lines = textwrap.wrap(text, width=max_chars)
         
-        # Ajuste de tamanho da fonte e espaçamento
         font_size = 70 if len(text) > 50 else 90
         line_spacing = int(font_size * 1.4)
-        
-        # Calcular altura inicial para centralizar
         total_height = (len(lines) - 1) * line_spacing
         start_y = 400 - (total_height / 2)
 
-        # 3. Construir Filtros Drawtext
         draw_cmds = []
         for i, line in enumerate(lines):
             safe_line = line.replace(":", "\\:").replace("'", "")
             y_pos = start_y + (i * line_spacing)
-            
-            # Lógica de Cor: Linha índice 1 (a segunda) é Vermelha, o resto Amarelo
-            color = "red" if i == 1 else "yellow"
+            color = "red" if i == 1 else "yellow" # Lógica de cores
             
             cmd = (
                 f"drawtext=fontfile='{local_font}':text='{safe_line}':"
@@ -375,8 +379,8 @@ def gerar_thumbnail():
 
         filter_complex = ",".join(draw_cmds)
 
-        # 4. Executar FFmpeg
-        print(f"[{unique_id}] Renderizando thumbnail...")
+        # 5. Renderização com FFmpeg
+        print(f"[{unique_id}] Renderizando...")
         command = [
             'ffmpeg', '-y',
             '-i', local_image,
@@ -385,25 +389,25 @@ def gerar_thumbnail():
             local_output
         ]
 
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"Erro FFmpeg: {result.stderr}")
+        subprocess.run(command, check=True, capture_output=True)
 
-        # 5. Upload do Resultado
-        output_key = f"THUMB_FINAL_{unique_id}.jpg"
-        s3.upload_file(local_output, bucket_out, output_key)
+        # 6. Upload do Resultado de volta para o MinIO
+        output_key = f"thumb_final_{unique_id}.jpg"
+        s3.upload_file(local_output, bucket_name, output_key)
 
         return jsonify({
             "status": "sucesso",
-            "file": output_key
+            "file": output_key,
+            "url_minio": f"/{bucket_name}/{output_key}"
         }), 200
 
     except Exception as e:
         print(f"ERRO: {e}")
         return jsonify({"erro": str(e)}), 500
     finally:
+        # Limpeza
+        import shutil
         shutil.rmtree(work_dir, ignore_errors=True)
-        
         
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
