@@ -33,62 +33,58 @@ def criar_video():
     images_list = data.get('images_list', [])
     bucket_out = data.get('bucket_out')
 
-    if not images_list:
-        return jsonify({"erro": "Lista de imagens vazia"}), 400
-
     unique_id = str(uuid.uuid4())
     work_dir = f"/tmp/{unique_id}"
     os.makedirs(work_dir, exist_ok=True)
     local_audio = f"{work_dir}/audio.mp3"
     
     try:
-        # 1. Download do Áudio
-        print(f"[{unique_id}] Baixando áudio...")
+        # --- DIAGNÓSTICO PRECISO ---
+        
+        # 1. Tenta baixar o Áudio
+        print(f"[{unique_id}] Baixando áudio: {audio_key}")
         try:
             s3.download_file(bucket_in, audio_key, local_audio)
-        except Exception:
-            raise Exception(f"ERRO: Áudio '{audio_key}' não encontrado.")
+        except Exception as e:
+            raise Exception(f"ERRO DE ARQUIVO: Não achei o áudio '{audio_key}' no bucket '{bucket_in}'.")
 
-        # 2. Download das Imagens (COM CORREÇÃO DE EXTENSÃO)
+        # 2. Tenta baixar as Imagens uma por uma
         print(f"[{unique_id}] Baixando {len(images_list)} imagens...")
-        
-        # Pega a extensão da primeira imagem para ser o "Mestre" (ex: jpg)
-        master_ext = images_list[0].split('.')[-1]
+        first_ext = "jpg"
         
         for index, img_key in enumerate(images_list):
-            # MUDANÇA AQUI:
-            # Não usamos mais a extensão do arquivo original para salvar no disco.
-            # Forçamos todos a terem a 'master_ext' para o padrão do FFmpeg não quebrar.
-            local_img_name = f"{work_dir}/img_{index:03d}.{master_ext}"
-            
             try:
+                ext = img_key.split('.')[-1]
+                if index == 0: first_ext = ext
+                local_img_name = f"{work_dir}/img_{index:03d}.{ext}"
+                
                 s3.download_file(bucket_in, img_key, local_img_name)
-            except Exception:
-                raise Exception(f"ERRO: Imagem '{img_key}' (índice {index+1}) não encontrada.")
+            except Exception as e:
+                # AQUI ESTÁ O SEGREDO: Ele vai te contar qual imagem falhou
+                raise Exception(f"ERRO DE ARQUIVO: Não achei a imagem '{img_key}' (índice {index+1}) no bucket '{bucket_in}'. Verifique se o loop no n8n gerou os arquivos corretamente.")
 
-        # 3. Renderização
+        # 3. Renderização (Se chegou aqui, os arquivos existem)
         audio_duration = get_audio_duration(local_audio)
         framerate = len(images_list) / audio_duration
         local_video_out = f"{work_dir}/video_final.mp4"
 
-        print(f"[{unique_id}] Renderizando com framerate {framerate:.4f}...")
+        print(f"[{unique_id}] Renderizando...")
         
+        # Monta comando do FFmpeg
         command = [
             'ffmpeg', '-y',
             '-framerate', str(framerate),
-            # Agora garantimos que todas as imagens no disco terminam com .{master_ext}
-            '-i', f"{work_dir}/img_%03d.{master_ext}", 
+            '-i', f"{work_dir}/img_%03d.{first_ext}", 
             '-i', local_audio,
             '-c:v', 'libx264', '-r', '30', '-pix_fmt', 'yuv420p',
             '-shortest',
             local_video_out
         ]
         
-        # Lógica para 1 imagem (Vídeo Estático)
         if len(images_list) == 1:
             command = [
                 'ffmpeg', '-y', '-loop', '1',
-                '-i', f"{work_dir}/img_000.{master_ext}",
+                '-i', f"{work_dir}/img_000.{first_ext}",
                 '-i', local_audio,
                 '-c:v', 'libx264', '-tune', 'stillimage',
                 '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p',
@@ -103,6 +99,7 @@ def criar_video():
         return jsonify({"status": "sucesso", "file": output_key}), 200
 
     except Exception as e:
+        # Retorna o erro limpo para o n8n
         return jsonify({"erro": str(e)}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
