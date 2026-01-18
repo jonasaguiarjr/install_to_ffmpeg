@@ -21,12 +21,8 @@ def processar():
     file_key = data.get('file_key')
     bucket_out = data.get('bucket_out')
 
-    # --- MUDANÇA CRÍTICA AQUI ---
-    # Geramos um ID único para esta execução específica
     unique_id = str(uuid.uuid4())
-    
-    # O arquivo no disco terá esse ID no nome para não colidir com outros
-    safe_filename = file_key.replace('/', '_') # Remove barras para evitar erros de pasta
+    safe_filename = file_key.replace('/', '_')
     local_input = f"/tmp/{unique_id}_{safe_filename}"
     local_output = f"/tmp/{unique_id}_processed_{safe_filename}"
 
@@ -38,7 +34,7 @@ def processar():
         if os.path.getsize(local_input) == 0:
             raise Exception("Arquivo vazio (0 bytes).")
 
-        # 2. FFmpeg
+        # 2. Conversão FFmpeg
         print(f"[{unique_id}] Convertendo...")
         command = [
             'ffmpeg', '-y', 
@@ -48,25 +44,35 @@ def processar():
         ]
         
         result = subprocess.run(command, capture_output=True, text=True)
-
         if result.returncode != 0:
             raise Exception(f"Erro FFmpeg: {result.stderr}")
 
-        if not os.path.exists(local_output):
-            raise Exception(f"Arquivo de saída não gerado. Log: {result.stderr}")
+        # --- NOVO BLOCO: Capturar Duração com FFprobe ---
+        print(f"[{unique_id}] Calculando duração...")
+        probe_command = [
+            'ffprobe', 
+            '-v', 'error', 
+            '-show_entries', 'format=duration', 
+            '-of', 'default=noprint_wrappers=1:nokey=1', 
+            local_output
+        ]
+        # O resultado vem como string (ex: "177.532"), convertemos para float
+        duration_str = subprocess.check_output(probe_command).decode('utf-8').strip()
+        duration_seconds = float(duration_str)
+        # ------------------------------------------------
 
         # 3. Upload
-        # O nome no Bucket continua sendo o bonito (processed_narracao.mp3)
-        # Só o nome temporário local que é "feio" (uuid_processed...)
         final_output_key = f"processed_{file_key}"
-        
         print(f"[{unique_id}] Subindo {final_output_key}...")
         s3.upload_file(local_output, bucket_out, final_output_key)
 
+        # Retorna o JSON com a duração incluída
         return jsonify({
             "status": "sucesso", 
             "file": final_output_key, 
-            "bucket": bucket_out
+            "bucket": bucket_out,
+            "duration_seconds": duration_seconds,
+            "duration_formatted": f"{duration_seconds:.2f}s"
         }), 200
 
     except Exception as e:
@@ -74,12 +80,10 @@ def processar():
         return jsonify({"erro": str(e)}), 500
 
     finally:
-        # Limpeza segura: apaga apenas os arquivos DESTA execução (pelo ID)
         if os.path.exists(local_input):
             os.remove(local_input)
         if os.path.exists(local_output):
             os.remove(local_output)
 
 if __name__ == '__main__':
-    # Threaded=True ajuda a lidar com múltiplas requisições simultâneas
     app.run(host='0.0.0.0', port=5000, threaded=True)
