@@ -1,12 +1,14 @@
 import os
+import glob
 import subprocess
 import boto3
 import uuid
+import shutil
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Configurações do MinIO
+# Configurações MinIO
 s3 = boto3.client('s3',
     endpoint_url=os.environ.get('S3_ENDPOINT'),
     aws_access_key_id=os.environ.get('S3_ACCESS_KEY'),
@@ -14,76 +16,109 @@ s3 = boto3.client('s3',
     region_name='us-east-1'
 )
 
-@app.route('/processar-audio', methods=['POST'])
-def processar():
+@app.route('/criar-video', methods=['POST'])
+def criar_video():
+    # Esperamos receber:
+    # {
+    #   "bucket_in": "ffmpeg",
+    #   "audio_key": "narracao.mp3",
+    #   "images_list": ["img1.jpg", "img2.jpg", "img3.jpg"],
+    #   "bucket_out": "ffmpeg"
+    # }
     data = request.json
     bucket_in = data.get('bucket_in')
-    file_key = data.get('file_key')
+    audio_key = data.get('audio_key')
+    images_list = data.get('images_list', [])
     bucket_out = data.get('bucket_out')
 
+    if not images_list:
+        return jsonify({"erro": "Lista de imagens vazia"}), 400
+
     unique_id = str(uuid.uuid4())
-    safe_filename = file_key.replace('/', '_')
-    local_input = f"/tmp/{unique_id}_{safe_filename}"
-    local_output = f"/tmp/{unique_id}_processed_{safe_filename}"
+    work_dir = f"/tmp/{unique_id}"
+    os.makedirs(work_dir, exist_ok=True)
+
+    local_audio = f"{work_dir}/audio_input.mp3"
+    local_video_out = f"{work_dir}/video_final.mp4"
 
     try:
-        # 1. Download
-        print(f"[{unique_id}] Baixando {file_key}...")
-        s3.download_file(bucket_in, file_key, local_input)
+        # 1. Baixar Áudio
+        print(f"[{unique_id}] Baixando áudio: {audio_key}")
+        s3.download_file(bucket_in, audio_key, local_audio)
 
-        if os.path.getsize(local_input) == 0:
-            raise Exception("Arquivo vazio (0 bytes).")
+        # 2. Baixar Imagens e Renomear (001.jpg, 002.jpg...)
+        print(f"[{unique_id}] Baixando {len(images_list)} imagens...")
+        for index, img_key in enumerate(images_list):
+            # Extensão do arquivo original
+            ext = img_key.split('.')[-1]
+            # Nome sequencial obrigatório para o FFmpeg (000.jpg, 001.jpg)
+            local_img_name = f"{work_dir}/img_{index:03d}.{ext}"
+            s3.download_file(bucket_in, img_key, local_img_name)
 
-        # 2. Conversão FFmpeg
-        print(f"[{unique_id}] Convertendo...")
-        command = [
-            'ffmpeg', '-y', 
-            '-i', local_input, 
-            '-ar', '16000', '-ac', '1', 
-            local_output
-        ]
+        # 3. Calcular duração do áudio (para o vídeo ter o mesmo tamanho)
+        probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', local_audio]
+        audio_duration = float(subprocess.check_output(probe_cmd).decode('utf-8').strip())
         
-        result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise Exception(f"Erro FFmpeg: {result.stderr}")
+        # Tempo por imagem (distribui as imagens pelo tempo do áudio)
+        # Ex: Se áudio tem 10s e temos 5 imagens = 2s por imagem
+        framerate = len(images_list) / audio_duration
 
-        # --- NOVO BLOCO: Capturar Duração com FFprobe ---
-        print(f"[{unique_id}] Calculando duração...")
-        probe_command = [
-            'ffprobe', 
-            '-v', 'error', 
-            '-show_entries', 'format=duration', 
-            '-of', 'default=noprint_wrappers=1:nokey=1', 
-            local_output
+        # 4. Comando FFmpeg para criar Slideshow
+        # -framerate: define quantas imagens por segundo (inverso do tempo por imagem)
+        # -i img_%03d.jpg: padrão de arquivo sequencial
+        # -c:v libx264: codec de vídeo compatível
+        # -pix_fmt yuv420p: garante compatibilidade com players (Quicktime/Windows)
+        # -shortest: termina o vídeo quando o menor input (áudio ou imagens) acabar
+        print(f"[{unique_id}] Renderizando vídeo...")
+        
+        command = [
+            'ffmpeg', '-y',
+            '-framerate', str(framerate),
+            '-i', f"{work_dir}/img_%03d.jpg",  # Input Imagens
+            '-i', local_audio,                 # Input Áudio
+            '-c:v', 'libx264',
+            '-r', '30',                        # FPS de saída do vídeo (fluidez)
+            '-pix_fmt', 'yuv420p',
+            '-shortest',                       # Corta se sobrar imagem
+            local_video_out
         ]
-        # O resultado vem como string (ex: "177.532"), convertemos para float
-        duration_str = subprocess.check_output(probe_command).decode('utf-8').strip()
-        duration_seconds = float(duration_str)
-        # ------------------------------------------------
 
-        # 3. Upload
-        final_output_key = f"processed_{file_key}"
-        print(f"[{unique_id}] Subindo {final_output_key}...")
-        s3.upload_file(local_output, bucket_out, final_output_key)
+        # Se tiver só 1 imagem, usamos 'loop'
+        if len(images_list) == 1:
+            command = [
+                'ffmpeg', '-y',
+                '-loop', '1',
+                '-i', f"{work_dir}/img_000.jpg",
+                '-i', local_audio,
+                '-c:v', 'libx264',
+                '-tune', 'stillimage',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-pix_fmt', 'yuv420p',
+                '-shortest',
+                local_video_out
+            ]
 
-        # Retorna o JSON com a duração incluída
+        subprocess.run(command, check=True)
+
+        # 5. Upload
+        output_key = f"video_{unique_id}.mp4"
+        print(f"[{unique_id}] Subindo {output_key}...")
+        s3.upload_file(local_video_out, bucket_out, output_key)
+
         return jsonify({
-            "status": "sucesso", 
-            "file": final_output_key, 
-            "bucket": bucket_out,
-            "duration_seconds": duration_seconds,
-            "duration_formatted": f"{duration_seconds:.2f}s"
+            "status": "sucesso",
+            "file": output_key,
+            "bucket": bucket_out
         }), 200
 
     except Exception as e:
-        print(f"ERRO: {str(e)}")
+        print(f"ERRO: {e}")
         return jsonify({"erro": str(e)}), 500
-
+        
     finally:
-        if os.path.exists(local_input):
-            os.remove(local_input)
-        if os.path.exists(local_output):
-            os.remove(local_output)
+        # Limpa a pasta inteira do job
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
