@@ -229,18 +229,20 @@ def queimar_legenda():
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-# --- ROTA 4: ADICIONAR TRILHA SONORA (Versão Debug) ---
+# --- ROTA 4: MIXAGEM FINAL (COM PRESERVAÇÃO DE CANAIS) ---
 @app.route('/adicionar-musica', methods=['POST'])
 def adicionar_musica():
     data = request.json
     bucket_in = data.get('bucket_in')
-    video_key = data.get('video_key')
+    video_key = data.get('video_key')       # Vídeo que já tem legenda e narração
     music_list = data.get('music_list', []) 
     bucket_out = data.get('bucket_out')
+    
+    # Volume padrão 0.15 (15%) se não for informado
     bg_volume = data.get('volume', 0.15)
 
     if not music_list:
-        return jsonify({"erro": "Lista de músicas vazia no JSON de entrada."}), 400
+        return jsonify({"erro": "Lista de músicas vazia."}), 400
 
     unique_id = str(uuid.uuid4())
     work_dir = f"/tmp/{unique_id}"
@@ -251,41 +253,41 @@ def adicionar_musica():
     concat_list_path = f"{work_dir}/music_list.txt"
 
     try:
-        # 1. Download do Vídeo
+        # 1. Downloads
         print(f"[{unique_id}] Baixando vídeo: {video_key}")
         try:
             s3.download_file(bucket_in, video_key, local_video)
         except Exception:
-            raise Exception(f"ERRO FATAL: O vídeo '{video_key}' não foi encontrado no bucket '{bucket_in}'. Verifique se o passo anterior (Legenda) funcionou.")
+            raise Exception(f"ERRO: Vídeo '{video_key}' não encontrado.")
 
-        # 2. Download das Músicas (SEM TRY/CATCH para mostrar o erro)
-        print(f"[{unique_id}] Baixando músicas...")
+        print(f"[{unique_id}] Baixando {len(music_list)} músicas...")
         with open(concat_list_path, 'w') as f:
             for i, music_key in enumerate(music_list):
                 local_music = f"{work_dir}/bg_{i}.mp3"
-                
-                # AQUI MUDOU: Se der erro, ele vai te avisar no n8n!
                 try:
                     s3.download_file(bucket_in, music_key, local_music)
-                except Exception as e:
-                    raise Exception(f"ERRO FATAL: A música '{music_key}' não está no bucket '{bucket_in}'. Verifique se o nome no 'S3 Upload' bate com a lista gerada.")
-                
+                except Exception:
+                    raise Exception(f"ERRO: Música '{music_key}' não encontrada.")
                 f.write(f"file '{local_music}'\n")
 
-        # Verifica se a lista foi criada corretamente
-        if os.path.getsize(concat_list_path) == 0:
-             raise Exception("Erro Interno: A lista de músicas foi criada vazia.")
-
-        # 3. Mixagem
-        print(f"[{unique_id}] Mixando...")
+        # 2. Mixagem Profissional (Stereo + Ducking)
+        print(f"[{unique_id}] Mixando áudio (Vol: {bg_volume})...")
+        
+        # EXPLICAÇÃO DO COMANDO:
+        # [0:a]aformat=channel_layouts=stereo[a_nar] -> Pega áudio do vídeo, força Stereo, chama de 'a_nar'
+        # [1:a]aformat=channel_layouts=stereo,volume={bg_volume}[a_mus] -> Pega música, força Stereo, baixa volume, chama de 'a_mus'
+        # [a_nar][a_mus]amix... -> Junta os dois
+        
         command = [
             'ffmpeg', '-y',
             '-i', local_video,
             '-f', 'concat', '-safe', '0', '-i', concat_list_path,
             '-filter_complex', 
-            f"[1:a]volume={bg_volume}[bg];[0:a][bg]amix=inputs=2:duration=first[a_out]",
-            '-map', '0:v', '-map', '[a_out]',
-            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
+            f"[0:a]aformat=channel_layouts=stereo[a_nar];[1:a]aformat=channel_layouts=stereo,volume={bg_volume}[a_mus];[a_nar][a_mus]amix=inputs=2:duration=first:dropout_transition=0[a_out]",
+            '-map', '0:v',      # Mantém vídeo original
+            '-map', '[a_out]',  # Usa o novo áudio mixado
+            '-c:v', 'copy',     # Copia o vídeo (não perde qualidade e é rápido)
+            '-c:a', 'aac', '-b:a', '192k', # Codifica o áudio final
             local_output
         ]
 
@@ -293,21 +295,22 @@ def adicionar_musica():
         if result.returncode != 0:
             raise Exception(f"Erro FFmpeg: {result.stderr}")
 
-        # 4. Upload
+        # 3. Upload
         output_key = f"VIDEO_FINAL_{unique_id}.mp4"
+        print(f"[{unique_id}] Subindo {output_key}...")
         s3.upload_file(local_output, bucket_out, output_key)
 
         return jsonify({
             "status": "sucesso",
             "file": output_key,
-            "stats": {"msg": "Mixagem concluída"}
+            "stats": {"volume_aplicado": bg_volume}
         }), 200
 
     except Exception as e:
-        print(f"ERRO: {e}")
+        print(f"ERRO MIX: {e}")
         return jsonify({"erro": str(e)}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
-
+        
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, threaded=True)
