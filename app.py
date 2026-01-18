@@ -232,14 +232,13 @@ def queimar_legenda():
 # --- ROTA 4: ADICIONAR TRILHA SONORA ---
 @app.route('/adicionar-musica', methods=['POST'])
 def adicionar_musica():
-    """Recebe vídeo e lista de músicas, mistura com volume baixo (ducking)."""
+    """Recebe vídeo e lista de músicas, mistura com ducking e corta no final."""
     data = request.json
     bucket_in = data.get('bucket_in')
-    video_key = data.get('video_key')       # ex: final_com_legenda.mp4
-    music_list = data.get('music_list', []) # Lista: ['bg_music_0.mp3', 'bg_music_1.mp3']
+    video_key = data.get('video_key')       # O vídeo já com legenda (e narração)
+    music_list = data.get('music_list', []) 
     bucket_out = data.get('bucket_out')
-    # Volume da música (0.1 = 10%, 0.2 = 20%). Ajuste conforme necessário.
-    bg_volume = data.get('volume', 0.15) 
+    bg_volume = data.get('volume', 0.15)    # Volume da música (padrão 15%)
 
     if not music_list:
         return jsonify({"erro": "Lista de músicas vazia"}), 400
@@ -249,16 +248,19 @@ def adicionar_musica():
     os.makedirs(work_dir, exist_ok=True)
 
     local_video = f"{work_dir}/video_input.mp4"
-    local_output = f"{work_dir}/video_final_com_audio.mp4"
+    local_output = f"{work_dir}/video_final_pronto.mp4"
     concat_list_path = f"{work_dir}/music_list.txt"
 
     try:
-        # 1. Download do Vídeo
+        # 1. Download do Vídeo (que tem a Narração)
         print(f"[{unique_id}] Baixando vídeo: {video_key}")
-        s3.download_file(bucket_in, video_key, local_video)
+        try:
+            s3.download_file(bucket_in, video_key, local_video)
+        except Exception:
+            raise Exception(f"Vídeo '{video_key}' não encontrado.")
 
-        # 2. Download das Músicas e Criação da Playlist
-        print(f"[{unique_id}] Preparando {len(music_list)} músicas...")
+        # 2. Download e Preparação das Músicas
+        print(f"[{unique_id}] Preparando playlist de fundo...")
         with open(concat_list_path, 'w') as f:
             for i, music_key in enumerate(music_list):
                 local_music = f"{work_dir}/bg_{i}.mp3"
@@ -266,17 +268,20 @@ def adicionar_musica():
                     s3.download_file(bucket_in, music_key, local_music)
                     f.write(f"file '{local_music}'\n")
                 except Exception:
-                    print(f"Aviso: Música {music_key} falhou. Ignorando.")
+                    print(f"Aviso: Música {music_key} falhou.")
 
-        # 3. Mixagem com FFmpeg
-        # Lógica:
-        # - Input 0: Vídeo (tem vídeo + voz)
-        # - Input 1: Lista de Músicas (concat)
-        # - Filter: 
-        #    1. [1:a] ajusta volume da música para 15% [musica_baixa]
-        #    2. [0:a][musica_baixa] mistura os dois, duração do mais curto (vídeo)
+        # 3. Medir Durações (Substitui seus nós de ffprobe no n8n)
+        duration_video = get_audio_duration(local_video) # Duração da narração/vídeo
         
-        print(f"[{unique_id}] Mixando áudio (Volume: {bg_volume})...")
+        # Para medir a música total, precisamos concatenar virtualmente ou estimar. 
+        # Aqui, vamos focar que o output terá a duração do vídeo (duration=first).
+
+        # 4. Mixagem (O seu comando amix traduzido)
+        # Input 0: Vídeo (Imagem + Narração)
+        # Input 1: Playlist de Músicas
+        # Filtro: Ajusta volume da música -> Mixa com vídeo -> Corta quando vídeo acaba
+        
+        print(f"[{unique_id}] Mixando áudio (Vol: {bg_volume})...")
         
         command = [
             'ffmpeg', '-y',
@@ -284,10 +289,10 @@ def adicionar_musica():
             '-f', 'concat', '-safe', '0', '-i', concat_list_path,
             '-filter_complex', 
             f"[1:a]volume={bg_volume}[bg];[0:a][bg]amix=inputs=2:duration=first[a_out]",
-            '-map', '0:v',      # Usa o vídeo do input 0
-            '-map', '[a_out]',  # Usa o áudio mixado
-            '-c:v', 'copy',     # Não re-encoda o vídeo (Super Rápido!)
-            '-c:a', 'aac', '-b:a', '192k',
+            '-map', '0:v',      # Mantém o vídeo original
+            '-map', '[a_out]',  # Usa o novo áudio mixado
+            '-c:v', 'copy',     # Copia o vídeo (rápido, sem perda)
+            '-c:a', 'aac', '-b:a', '192k', # Re-encoda o áudio final
             local_output
         ]
 
@@ -295,19 +300,24 @@ def adicionar_musica():
         if result.returncode != 0:
             raise Exception(f"Erro FFmpeg: {result.stderr}")
 
-        # 4. Upload
-        output_key = f"final_ready_{unique_id}.mp4"
+        # 5. Upload
+        output_key = f"VIDEO_FINAL_{unique_id}.mp4"
         print(f"[{unique_id}] Subindo {output_key}...")
         s3.upload_file(local_output, bucket_out, output_key)
 
+        # Retorna os dados que você queria no n8n
         return jsonify({
             "status": "sucesso",
             "file": output_key,
-            "bucket": bucket_out
+            "bucket": bucket_out,
+            "stats": {
+                "duracao_final": duration_video,
+                "musicas_usadas": len(music_list)
+            }
         }), 200
 
     except Exception as e:
-        print(f"ERRO MUSIC: {e}")
+        print(f"ERRO MIX: {e}")
         return jsonify({"erro": str(e)}), 500
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
