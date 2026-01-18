@@ -36,7 +36,7 @@ def processar():
             '-ar', '16000', '-ac', '1', 
             local_output
         ]
-        result = subprocess.run(command, check=True)
+        result = subprocess.run(command, capture_output=True, text=True
         # Se o FFmpeg reclamar, paramos tudo e mostramos o erro
         if result.returncode != 0:
             raise Exception(f"Erro interno do FFmpeg: {result.stderr}")
