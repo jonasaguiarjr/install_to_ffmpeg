@@ -1,5 +1,4 @@
 import os
-import glob
 import subprocess
 import boto3
 import uuid
@@ -8,7 +7,7 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Configurações MinIO
+# --- CONFIGURAÇÃO MINIO ---
 s3 = boto3.client('s3',
     endpoint_url=os.environ.get('S3_ENDPOINT'),
     aws_access_key_id=os.environ.get('S3_ACCESS_KEY'),
@@ -16,15 +15,67 @@ s3 = boto3.client('s3',
     region_name='us-east-1'
 )
 
+# --- FUNÇÕES AUXILIARES ---
+def get_audio_duration(file_path):
+    """Extrai a duração exata do áudio em segundos usando ffprobe"""
+    cmd = [
+        'ffprobe', 
+        '-v', 'error', 
+        '-show_entries', 'format=duration', 
+        '-of', 'default=noprint_wrappers=1:nokey=1', 
+        file_path
+    ]
+    return float(subprocess.check_output(cmd).decode('utf-8').strip())
+
+# --- ROTA 1: PROCESSAR ÁUDIO & PEGAR DURAÇÃO ---
+@app.route('/processar-audio', methods=['POST'])
+def processar_audio():
+    data = request.json
+    bucket_in = data.get('bucket_in')
+    file_key = data.get('file_key')
+    bucket_out = data.get('bucket_out')
+
+    unique_id = str(uuid.uuid4())
+    work_dir = f"/tmp/{unique_id}"
+    os.makedirs(work_dir, exist_ok=True)
+    
+    local_input = f"{work_dir}/input_{file_key.replace('/', '_')}"
+    # Se quiser salvar processado, descomente abaixo. 
+    # Por enquanto, vamos focar em retornar a duração.
+    # local_output = f"{work_dir}/processed.mp3" 
+
+    try:
+        print(f"[{unique_id}] Baixando áudio para análise: {file_key}")
+        s3.download_file(bucket_in, file_key, local_input)
+
+        if os.path.getsize(local_input) == 0:
+            raise Exception("Arquivo de áudio vazio.")
+
+        # Pega a duração
+        duration = get_audio_duration(local_input)
+        print(f"[{unique_id}] Duração detectada: {duration}s")
+
+        # Se você precisar converter o áudio, faça aqui.
+        # Se for apenas para pegar dados, não precisamos rodar o ffmpeg pesado.
+
+        return jsonify({
+            "status": "sucesso", 
+            "file": file_key, 
+            "bucket": bucket_out,
+            "duration_seconds": duration,
+            "duration_formatted": f"{duration:.2f}s"
+        }), 200
+
+    except Exception as e:
+        print(f"ERRO AUDIO: {e}")
+        return jsonify({"erro": str(e)}), 500
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# --- ROTA 2: CRIAR VÍDEO (SLIDESHOW) ---
 @app.route('/criar-video', methods=['POST'])
 def criar_video():
-    # Esperamos receber:
-    # {
-    #   "bucket_in": "ffmpeg",
-    #   "audio_key": "narracao.mp3",
-    #   "images_list": ["img1.jpg", "img2.jpg", "img3.jpg"],
-    #   "bucket_out": "ffmpeg"
-    # }
     data = request.json
     bucket_in = data.get('bucket_in')
     audio_key = data.get('audio_key')
@@ -38,63 +89,53 @@ def criar_video():
     work_dir = f"/tmp/{unique_id}"
     os.makedirs(work_dir, exist_ok=True)
 
-    local_audio = f"{work_dir}/audio_input.mp3"
+    local_audio = f"{work_dir}/audio.mp3"
     local_video_out = f"{work_dir}/video_final.mp4"
 
     try:
-        # 1. Baixar Áudio
+        # 1. Download Áudio
         print(f"[{unique_id}] Baixando áudio: {audio_key}")
         s3.download_file(bucket_in, audio_key, local_audio)
 
-        # 2. Baixar Imagens e Renomear (001.jpg, 002.jpg...)
+        # 2. Download Imagens
         print(f"[{unique_id}] Baixando {len(images_list)} imagens...")
+        first_ext = "jpg" # Default
+        
         for index, img_key in enumerate(images_list):
-            # Extensão do arquivo original
             ext = img_key.split('.')[-1]
-            # Nome sequencial obrigatório para o FFmpeg (000.jpg, 001.jpg)
+            if index == 0: first_ext = ext
+            
+            # Salva como img_000.jpg, img_001.jpg, etc.
             local_img_name = f"{work_dir}/img_{index:03d}.{ext}"
             s3.download_file(bucket_in, img_key, local_img_name)
 
-        # 3. Calcular duração do áudio (para o vídeo ter o mesmo tamanho)
-        probe_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', local_audio]
-        audio_duration = float(subprocess.check_output(probe_cmd).decode('utf-8').strip())
-        
-        # Tempo por imagem (distribui as imagens pelo tempo do áudio)
-        # Ex: Se áudio tem 10s e temos 5 imagens = 2s por imagem
+        # 3. Calcula Framerate
+        audio_duration = get_audio_duration(local_audio)
         framerate = len(images_list) / audio_duration
-
-        # 4. Comando FFmpeg para criar Slideshow
-        # -framerate: define quantas imagens por segundo (inverso do tempo por imagem)
-        # -i img_%03d.jpg: padrão de arquivo sequencial
-        # -c:v libx264: codec de vídeo compatível
-        # -pix_fmt yuv420p: garante compatibilidade com players (Quicktime/Windows)
-        # -shortest: termina o vídeo quando o menor input (áudio ou imagens) acabar
-        print(f"[{unique_id}] Renderizando vídeo...")
         
+        # 4. Renderiza
+        print(f"[{unique_id}] Renderizando vídeo ({framerate:.2f} fps)...")
+        
+        # Comando padrão para múltiplas imagens
         command = [
             'ffmpeg', '-y',
             '-framerate', str(framerate),
-            '-i', f"{work_dir}/img_%03d.jpg",  # Input Imagens
-            '-i', local_audio,                 # Input Áudio
-            '-c:v', 'libx264',
-            '-r', '30',                        # FPS de saída do vídeo (fluidez)
-            '-pix_fmt', 'yuv420p',
-            '-shortest',                       # Corta se sobrar imagem
+            '-i', f"{work_dir}/img_%03d.{first_ext}", 
+            '-i', local_audio,
+            '-c:v', 'libx264', '-r', '30', '-pix_fmt', 'yuv420p',
+            '-shortest',
             local_video_out
         ]
 
-        # Se tiver só 1 imagem, usamos 'loop'
+        # Comando especial para imagem única (Loop)
         if len(images_list) == 1:
             command = [
                 'ffmpeg', '-y',
                 '-loop', '1',
-                '-i', f"{work_dir}/img_000.jpg",
+                '-i', f"{work_dir}/img_000.{first_ext}",
                 '-i', local_audio,
-                '-c:v', 'libx264',
-                '-tune', 'stillimage',
-                '-c:a', 'aac',
-                '-b:a', '192k',
-                '-pix_fmt', 'yuv420p',
+                '-c:v', 'libx264', '-tune', 'stillimage',
+                '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p',
                 '-shortest',
                 local_video_out
             ]
@@ -113,11 +154,9 @@ def criar_video():
         }), 200
 
     except Exception as e:
-        print(f"ERRO: {e}")
+        print(f"ERRO VIDEO: {e}")
         return jsonify({"erro": str(e)}), 500
-        
     finally:
-        # Limpa a pasta inteira do job
         shutil.rmtree(work_dir, ignore_errors=True)
 
 if __name__ == '__main__':
