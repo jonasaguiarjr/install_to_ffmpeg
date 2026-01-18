@@ -36,7 +36,14 @@ def processar():
             '-ar', '16000', '-ac', '1', 
             local_output
         ]
-        subprocess.run(command, check=True)
+        result = subprocess.run(command, check=True)
+        # Se o FFmpeg reclamar, paramos tudo e mostramos o erro
+        if result.returncode != 0:
+            raise Exception(f"Erro interno do FFmpeg: {result.stderr}")
+
+        # Se o arquivo não foi criado por algum mistério
+        if not os.path.exists(local_output):
+            raise Exception(f"FFmpeg rodou mas não gerou arquivo. Log: {result.stderr}")
 
         # 3. Upload para o MinIO
         output_key = f"processed_{file_key}"
