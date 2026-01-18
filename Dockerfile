@@ -1,14 +1,14 @@
-# Use a versão oficial mais recente
-FROM n8nio/n8n:latest
+# Imagem base leve com suporte a apt
+FROM node:18-slim
 
-# Troca para root para poder instalar pacotes
+# Root para instalar dependências
 USER root
 
-# Instala o ffmpeg (o n8n oficial usa base Alpine Linux)
-# O flag --no-cache mantém a imagem leve
+# Instala ffmpeg e dependências úteis
 RUN apt-get update && \
-    apt-get install -y ffmpeg && \
+    apt-get install -y ffmpeg curl && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-    
-# Retorna para o usuário 'node' (obrigatório para segurança e funcionamento do n8n)
-USER node
+
+# Comando para manter o container rodando
+CMD ["sleep", "infinity"]
